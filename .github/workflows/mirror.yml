@@ -1,0 +1,99 @@
+name: Mirror desktop release
+
+# Copies each published desktop release (installers + auto-update manifests) from the
+# private source repository into this public downloads-only repository.
+# SOURCE_REPO_TOKEN: fine-grained token with read-only "Contents" access to the source repo.
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to mirror (default: latest published)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: GBE-Media/EZTOAiDesktop-v1.0.0
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find release to mirror
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view -R "$SOURCE_REPO" --json tagName --jq .tagName)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Source release: $tag"
+
+      - name: Check whether it is already mirrored
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx false; then
+            echo "Already mirrored: $TAG"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download from source
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "$TAG" -R "$SOURCE_REPO" -D assets
+          ls -la assets
+          # Never publish a half release: both platforms' updater manifests must be present.
+          test -f assets/latest.yml
+          test -f assets/latest-mac.yml
+          ls assets/*.exe >/dev/null
+          ls assets/*.dmg >/dev/null
+
+      - name: Publish here
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" assets/* --clobber
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --draft \
+              --title "BidveraAI $version" --notes "BidveraAI desktop $version." assets/*
+          fi
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "Mirrored $TAG"
+
+      - name: Keep the last 10 releases
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for tag in $(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt,isDraft \
+            --jq 'map(select(.isDraft == false)) | sort_by(.createdAt) | reverse | .[10:] | .[].tagName'); do
+            gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
+          done
