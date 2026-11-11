@@ -91,9 +91,13 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
         run: |
           set -euo pipefail
-          for tag in $(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt,isDraft \
-            --jq 'map(select(.isDraft == false)) | sort_by(.createdAt) | reverse | .[10:] | .[].tagName'); do
+          # createdAt is the tagged commit's date (identical for every release here),
+          # so order by publish time and never delete the release just mirrored.
+          for tag in $(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt,isDraft \
+            --jq 'map(select(.isDraft == false)) | sort_by(.publishedAt) | reverse | .[10:] | .[].tagName'); do
+            [ "$tag" = "$TAG" ] && continue
             gh release delete "$tag" -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
           done
